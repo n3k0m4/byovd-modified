@@ -4,6 +4,7 @@ members = [
     "AppRemover-Killer",
     "BdApiUtil-Killer",
     "CcProtect-Killer",
+    "EnPortv-Killer",
     "GameDriverX64-Killer",
     "GoFlyDrv-Killer",
     "HWAudioOs2Ec-Killer",
