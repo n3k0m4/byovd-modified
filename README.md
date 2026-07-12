@@ -55,6 +55,7 @@ BYOVD/
 ├── Astra64-RW/                      # EnTech Astra32 / TVicHW astra64.sys -- standalone, kernel R/W demo (Shadow SSDT hijack -> SYSTEM)
 ├── BdApiUtil-Killer/                # Baidu BdApiUtil64 (CVE-2024-51324)
 ├── CcProtect-Killer/                # CnCrypt CcProtect
+├── EnPortv-Killer/                  # EnCase EnPortv
 ├── GameDriverX64-Killer/            # Fedeen GameDriverX64 (CVE-2025-61155)
 ├── GoFlyDrv-Killer/                 # Golink GoFlyDrv
 ├── HWAudioOs2Ec-Killer/             # Huawei Audio driver HWAudioOs2Ec.sys
@@ -215,6 +216,7 @@ Below are the drivers and their respective PoCs available in this repository:
 - **[Astra64-RW](https://github.com/BlackSnufkin/BYOVD/tree/main/Astra64-RW)**: Targets `astra64.sys` from `EnTech Taiwan` (Astra32 / TVicHW) -- standalone kernel R/W PoC.
 - **[BdApiUtil-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/BdApiUtil-Killer)**: Targets `BdApiUtil64.sys` from `Baidu AntiVirus` (CVE-2024-51324).
 - **[CcProtect-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/CcProtect-Killer)**: Targets `CcProtect.sys` from `CnCrypt`.
+- **[EnPortv-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/EnPortv-Killer)**: Targets `EnPortv.sys` from `Guidance EnCase`.
 - **[GameDriverX64-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/GameDriverX64-Killer)**: Targets `GameDriverX64.sys` from `Fedeen Games` (CVE-2025-61155).
 - **[GoFlyDrv-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/GoFlyDrv-Killer)**: Targets `GoFlyDrv.sys` from `Golink`.
 - **[HWAudioOs2Ec-Killer](https://github.com/BlackSnufkin/BYOVD/tree/main/HWAudioOs2Ec-Killer)**: Targets `HWAudioOs2Ec.sys` from `Huawei`.
