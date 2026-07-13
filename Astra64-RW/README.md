@@ -14,7 +14,7 @@ Not yet in [LOLDDrivers](https://www.loldrivers.io/) (pending issue [magicsword-
 
 ## What it does
 
-The primitive is kernel R/W. The visible payload is a SYSTEM token swap: the PoC patches one entry in `KeServiceDescriptorTableShadow` to point at a controlled gadget whose IAT slot is overwritten with `nt!memmove`, then triggers it from user-mode via `NtUserSetWindowPos`. The kernel ends up running `memmove(our_eprocess+TokenOffset, system_eprocess+TokenOffset, 8)` in the caller's context, the SYSTEM token lands on the calling process, the patch is reverted, and `cmd.exe` is launched.
+The primitive is kernel R/W. The visible payload is a SYSTEM token swap, followed by EDR-callback neutralization, followed by a PPL bump on the spawned shell: the PoC patches one entry in `KeServiceDescriptorTableShadow` to point at a controlled gadget whose IAT slot is overwritten with `nt!memmove`, then triggers it from user-mode via `NtUserSetWindowPos`. The kernel ends up running `memmove(our_eprocess+TokenOffset, system_eprocess+TokenOffset, 8)` in the caller's context, the SYSTEM token lands on the calling process, the patch is reverted, the Ps / Ob / Cm notification lists are walked and every non-Microsoft callback is nulled, `cmd.exe` is launched, and its `EPROCESS.Protection` byte is flipped to `PsProtectedSignerWinTcb-Light` so any surviving userland EDR agent can no longer `OpenProcess` / inject / kill it.
 
 Outline:
 
@@ -27,17 +27,22 @@ Outline:
 7. Pick a 16-byte aligned `FF 25 disp32` thunk in the Win32k host as the gadget.
 8. Find the System and self `EPROCESS` via active process links.
 9. Patch the shadow SSDT entry + gadget IAT slot, GUI-convert the thread, fire `NtUserSetWindowPos`.
-10. Restore both writes, spawn `cmd.exe`.
+10. Restore both writes.
+11. Walk `PsLoadedModuleList` to build a driver ownership map, then null every third-party entry in `PspCreateProcessNotifyRoutine[]`, `PspCreateThreadNotifyRoutine[]`, `PspLoadImageNotifyRoutine[]`, `PsProcessType->CallbackList`, `PsThreadType->CallbackList`, and `CmpCallbackListHead`.
+12. Spawn `cmd.exe`.
+13. Locate the child's `EPROCESS` via `ActiveProcessLinks`, resolve the `Protection` byte offset dynamically (System has `0x72`, our launcher has `0x00`), and write `0x61` (`PsProtectedSignerWinTcb-Light`) to elevate the shell to PPL.
 
 ## Source layout
 
 ```
 src/
-├── main.rs    banner + dispatch (no flags, no args)
-├── astra.rs   ASTRA64 driver wrapper, IOCTLs, kernel-pointer helpers
-├── kernel.rs  4-level page-table walk, vread/vwrite, CR3 finder, EPROCESS walk
-├── pe.rs      load_image, export_rva (on-disk PE helpers)
-└── lpe.rs     the full SSDT-hijack + token-swap flow
+├── main.rs       banner + dispatch (no flags, no args)
+├── astra.rs      ASTRA64 driver wrapper, IOCTLs, kernel-pointer helpers
+├── kernel.rs     4-level page-table walk, vread/vwrite, CR3 finder, EPROCESS walk
+├── pe.rs         load_image, export_rva (on-disk PE helpers)
+├── callbacks.rs  PsLoadedModuleList walk, Ps/Ob/Cm callback neutralization
+├── ppl.rs        EPROCESS.Protection dynamic-offset resolver + PPL bump
+└── lpe.rs        the full SSDT-hijack + token-swap + callback-wipe + PPL flow
 ```
 
 ## Usage

@@ -16,9 +16,11 @@
 #![allow(non_snake_case, non_camel_case_types, dead_code)]
 
 mod astra;
+mod callbacks;
 mod kernel;
 mod lpe;
 mod pe;
+mod ppl;
 
 fn main() {
     println!();

